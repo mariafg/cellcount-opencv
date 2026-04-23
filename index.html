@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hemocytometer Grid Detector</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: 'Courier New', Courier, monospace;
+    background: #111;
+    color: #ccc;
+    padding: 24px;
+    min-height: 100vh;
+}
+
+h1 { color: #4af; font-size: 1.35em; margin-bottom: 4px; }
+.subtitle { color: #555; font-size: 0.85em; margin-bottom: 24px; }
+
+.controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+}
+
+.file-label {
+    display: inline-block;
+    background: #1e1e1e;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 0.875em;
+    transition: border-color 0.15s;
+}
+.file-label:hover { border-color: #4af; }
+input[type="file"] { display: none; }
+
+#file-name { color: #555; font-size: 0.82em; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+#btn-analyse {
+    background: #4af;
+    color: #000;
+    border: none;
+    border-radius: 3px;
+    padding: 6px 18px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.875em;
+    font-weight: bold;
+    transition: background 0.15s;
+}
+#btn-analyse:disabled { background: #2a2a2a; color: #444; cursor: not-allowed; }
+#btn-analyse:hover:not(:disabled) { background: #38c; }
+
+#cv-status { font-size: 0.8em; }
+#cv-status.loading { color: #fa0; }
+#cv-status.ready   { color: #4c4; }
+#cv-status.error   { color: #f44; }
+
+.canvas-wrap {
+    display: inline-block;
+    max-width: 100%;
+    border: 1px solid #2a2a2a;
+    overflow: auto;
+    max-height: 70vh;
+}
+
+canvas { display: block; max-width: 100%; }
+
+#status-panel {
+    margin-top: 16px;
+    background: #171717;
+    border: 1px solid #2a2a2a;
+    border-radius: 3px;
+    padding: 14px 18px;
+    display: none;
+    max-width: 520px;
+}
+#status-panel h2 {
+    font-size: 0.75em;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #444;
+    margin-bottom: 10px;
+}
+
+table { border-collapse: collapse; width: 100%; }
+td { padding: 3px 0; font-size: 0.875em; vertical-align: top; }
+td:first-child { color: #555; width: 200px; flex-shrink: 0; }
+
+.yes  { color: #4c4; }
+.no   { color: #f44; }
+.high { color: #4c4; }
+.low  { color: #fa0; }
+</style>
+</head>
+<body>
+
+<h1>Hemocytometer Grid Detector</h1>
+<p class="subtitle">Detects and outlines the counting grid using OpenCV.js contour + Hough line detection</p>
+
+<div class="controls">
+    <label class="file-label" for="file-input">Choose image (jpg / png)</label>
+    <input type="file" id="file-input" accept="image/jpeg,image/png">
+    <span id="file-name">No file chosen</span>
+    <button id="btn-analyse" disabled>Analyse</button>
+    <span id="cv-status" class="loading">Loading OpenCV.js…</span>
+</div>
+
+<div class="canvas-wrap">
+    <canvas id="canvas"></canvas>
+</div>
+
+<div id="status-panel">
+    <h2>Detection result</h2>
+    <table>
+        <tr><td>Grid detected</td>     <td id="s-found">—</td></tr>
+        <tr><td>Grid dimensions</td>   <td id="s-dims">—</td></tr>
+        <tr><td>Grid origin (x, y)</td><td id="s-origin">—</td></tr>
+        <tr><td>Confidence</td>        <td id="s-conf">—</td></tr>
+        <tr><td>Internal lines H / V</td><td id="s-lines">—</td></tr>
+    </table>
+</div>
+
+<!-- hidden image element holds the original for redraw on re-analyse -->
+<img id="img-src" style="display:none" crossorigin="anonymous">
+
+<script>
+// =====================================================================
+//  TUNABLE PARAMETERS
+//  All OpenCV parameters are collected here so you can adjust detection
+//  without hunting through the code.
+// =====================================================================
+
+// Pre-processing
+const BLUR_KERNEL  = 5;    // Gaussian blur kernel size (must be odd; try 3–9)
+                            //   Higher → smoother image, fewer spurious edges
+const CANNY_LOW    = 30;   // Canny lower hysteresis threshold
+                            //   Decrease to detect fainter grid lines
+const CANNY_HIGH   = 100;  // Canny upper hysteresis threshold
+const DILATE_ITERS = 2;    // Edge dilation passes (odd kernel 3×3)
+                            //   Increase to bridge gaps in broken grid lines
+
+// Contour-based rectangular region search
+const MIN_CONTOUR_AREA = 5000;  // Minimum area (px²) for a candidate region
+                                 //   Raise for high-res images (e.g. 50 000 for 4 K)
+                                 //   Lower if the grid fills only a small portion of the image
+const POLY_EPS_FACTOR  = 0.02;  // approxPolyDP tolerance as a fraction of the perimeter
+                                 //   Range 0.01–0.05; higher accepts noisier outlines
+const MIN_ASPECT = 0.35;         // Minimum width÷height for a valid grid candidate
+const MAX_ASPECT = 2.85;         // Maximum width÷height for a valid grid candidate
+
+// HoughLinesP — probabilistic Hough transform for internal line detection
+const HOUGH_RHO     = 1;            // Distance accumulator resolution (pixels)
+const HOUGH_THETA   = Math.PI/180;  // Angle accumulator resolution (radians)
+const HOUGH_THRESH  = 40;           // Minimum votes to keep a line
+                                     //   Decrease to find more (possibly spurious) lines
+const HOUGH_MIN_LEN = 40;           // Minimum line segment length (pixels)
+                                     //   Decrease for small or low-res images
+const HOUGH_MAX_GAP = 15;           // Maximum collinear gap to join segments (pixels)
+
+// Confidence scoring
+const ANGLE_TOL_DEG  = 15;  // Degrees from horizontal/vertical to classify a line
+const MIN_LINES_CONF =  4;  // Minimum H AND V lines inside the grid for "high" confidence
+
+// =====================================================================
+
+let cvReady   = false;
+let imgLoaded = false;
+
+const fileInput   = document.getElementById('file-input');
+const fileNameEl  = document.getElementById('file-name');
+const analyseBtn  = document.getElementById('btn-analyse');
+const cvStatusEl  = document.getElementById('cv-status');
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const srcImg      = document.getElementById('img-src');
+const statusPanel = document.getElementById('status-panel');
+
+// ---- OpenCV initialisation ------------------------------------------
+
+function onOpenCvReady() {
+    if (typeof cv === 'undefined') {
+        setCvStatus('error', 'OpenCV.js failed to load');
+        return;
+    }
+    // The WASM runtime may still be initialising after the JS is parsed
+    if (typeof cv.getBuildInformation === 'function') {
+        markCvReady();
+    } else {
+        cv.onRuntimeInitialized = markCvReady;
+    }
+}
+
+function markCvReady() {
+    cvReady = true;
+    setCvStatus('ready', 'OpenCV.js ready');
+    if (imgLoaded) analyseBtn.disabled = false;
+}
+
+function setCvStatus(cls, text) {
+    cvStatusEl.className   = cls;
+    cvStatusEl.textContent = text;
+}
+
+// ---- File upload ----------------------------------------------------
+
+fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    fileNameEl.textContent = file.name;
+    const url = URL.createObjectURL(file);
+    srcImg.onload = () => {
+        canvas.width  = srcImg.naturalWidth;
+        canvas.height = srcImg.naturalHeight;
+        ctx.drawImage(srcImg, 0, 0);
+        imgLoaded = true;
+        statusPanel.style.display = 'none';
+        if (cvReady) analyseBtn.disabled = false;
+        URL.revokeObjectURL(url);
+    };
+    srcImg.src = url;
+});
+
+// ---- Analyse button -------------------------------------------------
+
+analyseBtn.addEventListener('click', () => {
+    if (!cvReady || !imgLoaded) return;
+    analyseBtn.disabled    = true;
+    analyseBtn.textContent = 'Analysing…';
+    // Yield to the browser so the button label updates before heavy work
+    setTimeout(() => {
+        try     { runDetection(); }
+        catch(e){ console.error(e); overlayError(e.message); }
+        finally {
+            analyseBtn.disabled    = false;
+            analyseBtn.textContent = 'Analyse';
+        }
+    }, 30);
+});
+
+// ---- Utility: safe delete OpenCV objects ----------------------------
+
+function sdel(...objs) {
+    for (const o of objs) {
+        try { if (o && typeof o.delete === 'function') o.delete(); } catch (_) {}
+    }
+}
+
+// ---- Detection pipeline ---------------------------------------------
+
+function runDetection() {
+    // Redraw original so repeated analyses start from a clean canvas
+    ctx.drawImage(srcImg, 0, 0, canvas.width, canvas.height);
+
+    let src, gray, blurred, edges, dilated, kernel, contours, hier, lines;
+    let bestApprox = null;
+
+    try {
+        // Read canvas pixels into an RGBA cv.Mat
+        src      = cv.imread(canvas);
+        gray     = new cv.Mat();
+        blurred  = new cv.Mat();
+        edges    = new cv.Mat();
+        dilated  = new cv.Mat();
+        kernel   = cv.Mat.ones(3, 3, cv.CV_8U);
+        contours = new cv.MatVector();
+        hier     = new cv.Mat();
+        lines    = new cv.Mat();
+
+        // ── Step 1: Pre-processing ────────────────────────────────────
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.GaussianBlur(gray, blurred, new cv.Size(BLUR_KERNEL, BLUR_KERNEL), 0);
+        cv.Canny(blurred, edges, CANNY_LOW, CANNY_HIGH);
+        // Dilation connects broken edges caused by reflections or low contrast
+        cv.dilate(edges, dilated, kernel, new cv.Point(-1, -1), DILATE_ITERS);
+
+        // ── Step 2: Find largest rectangular contour ──────────────────
+        cv.findContours(dilated, contours, hier,
+            cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        const imgArea = canvas.width * canvas.height;
+        let bestArea  = 0;
+        let bestRect  = null;   // plain JS object {x,y,width,height}
+
+        for (let i = 0; i < contours.size(); i++) {
+            const c    = contours.get(i);   // must be deleted after use
+            const area = cv.contourArea(c);
+
+            // Skip contours that are too small or cover virtually the whole image
+            if (area < MIN_CONTOUR_AREA || area > imgArea * 0.97) {
+                c.delete(); continue;
+            }
+
+            const peri   = cv.arcLength(c, true);
+            const approx = new cv.Mat();
+            cv.approxPolyDP(c, approx, POLY_EPS_FACTOR * peri, true);
+            c.delete();
+
+            // Accept 4–8 vertex polygons (covers slight perspective distortion)
+            if (approx.rows >= 4 && approx.rows <= 8) {
+                const r  = cv.boundingRect(approx);
+                const ar = r.width / r.height;
+                if (ar >= MIN_ASPECT && ar <= MAX_ASPECT && area > bestArea) {
+                    bestArea = area;
+                    // Store as plain object so we don't hold a cv.Rect reference
+                    bestRect = { x: r.x, y: r.y, width: r.width, height: r.height };
+                    sdel(bestApprox);
+                    bestApprox = approx;   // keep alive; deleted in finally
+                } else {
+                    approx.delete();
+                }
+            } else {
+                approx.delete();
+            }
+        }
+
+        // ── Step 3: HoughLinesP to detect internal grid lines ─────────
+        // Run within the candidate ROI if we found one; otherwise full image.
+        // Internal lines are the key indicator of an actual hemocytometer grid.
+        let oX = 0, oY = 0;  // ROI origin offset for coordinate correction
+
+        if (bestRect) {
+            const roi = edges.roi(
+                new cv.Rect(bestRect.x, bestRect.y, bestRect.width, bestRect.height));
+            cv.HoughLinesP(roi, lines,
+                HOUGH_RHO, HOUGH_THETA, HOUGH_THRESH, HOUGH_MIN_LEN, HOUGH_MAX_GAP);
+            roi.delete();
+            oX = bestRect.x;
+            oY = bestRect.y;
+        } else {
+            // No contour candidate — try to infer grid bounds from lines alone
+            cv.HoughLinesP(edges, lines,
+                HOUGH_RHO, HOUGH_THETA, HOUGH_THRESH, HOUGH_MIN_LEN, HOUGH_MAX_GAP);
+        }
+
+        const angleTol = ANGLE_TOL_DEG * Math.PI / 180;
+        let hCount = 0, vCount = 0;
+        let minX = Infinity, maxX = -Infinity;
+        let minY = Infinity, maxY = -Infinity;
+
+        for (let i = 0; i < lines.rows; i++) {
+            // Each row: [x1, y1, x2, y2] stored as int32
+            const x1 = lines.data32S[i * 4]     + oX;
+            const y1 = lines.data32S[i * 4 + 1] + oY;
+            const x2 = lines.data32S[i * 4 + 2] + oX;
+            const y2 = lines.data32S[i * 4 + 3] + oY;
+
+            // atan2(|Δy|, |Δx|) → 0 = horizontal, π/2 = vertical
+            const a = Math.atan2(Math.abs(y2 - y1), Math.abs(x2 - x1));
+            if      (a <= angleTol)                  hCount++;
+            else if (a >= Math.PI / 2 - angleTol)    vCount++;
+
+            // Track line extents only when we don't already have a contour rect
+            if (!bestRect) {
+                minX = Math.min(minX, x1, x2);
+                maxX = Math.max(maxX, x1, x2);
+                minY = Math.min(minY, y1, y2);
+                maxY = Math.max(maxY, y1, y2);
+            }
+        }
+
+        // If no contour was found but lines form a plausible grid, use their
+        // bounding extent as a fallback grid rectangle
+        let gridRect = bestRect;
+        if (!gridRect
+                && hCount >= MIN_LINES_CONF && vCount >= MIN_LINES_CONF
+                && isFinite(minX)) {
+            gridRect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+        }
+
+        // ── Step 4: Render results ────────────────────────────────────
+        const detected   = gridRect !== null;
+        const highConf   = hCount >= MIN_LINES_CONF && vCount >= MIN_LINES_CONF;
+        const confidence = highConf ? 'high' : 'low';
+
+        if (detected) drawOverlay(bestApprox, gridRect, confidence);
+        else          drawFallback();
+
+        updateStatus(detected, gridRect, confidence, hCount, vCount);
+
+    } finally {
+        sdel(src, gray, blurred, edges, dilated, kernel, hier, lines, bestApprox);
+        sdel(contours);
+    }
+}
+
+// ---- Rendering helpers ----------------------------------------------
+
+/** Stroke width scaled to image size so it's visible on any resolution. */
+function strokeW() {
+    return Math.max(2, Math.round(Math.min(canvas.width, canvas.height) / 250));
+}
+
+function drawOverlay(approxMat, rect, confidence) {
+    const w = strokeW();
+    ctx.save();
+    ctx.strokeStyle = '#0055ff';
+    ctx.lineWidth   = w;
+    ctx.shadowColor = 'rgba(0, 80, 255, 0.55)';
+    ctx.shadowBlur  = w * 4;
+
+    if (approxMat && approxMat.rows >= 4) {
+        // Draw the full polygon so any slight tilt/perspective is preserved
+        ctx.beginPath();
+        ctx.moveTo(approxMat.data32S[0], approxMat.data32S[1]);
+        for (let i = 1; i < approxMat.rows; i++) {
+            ctx.lineTo(approxMat.data32S[i * 2], approxMat.data32S[i * 2 + 1]);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // Corner markers
+        ctx.shadowBlur = 0;
+        ctx.fillStyle  = '#00aaff';
+        const d = w * 5;
+        for (let i = 0; i < approxMat.rows; i++) {
+            ctx.fillRect(
+                approxMat.data32S[i * 2]     - d / 2,
+                approxMat.data32S[i * 2 + 1] - d / 2,
+                d, d);
+        }
+    } else {
+        // Fallback to axis-aligned rect (used when bounds came from Hough lines)
+        ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+    }
+
+    // Confidence label with dark background for readability
+    ctx.shadowBlur  = 0;
+    const fs    = Math.max(13, Math.round(Math.min(canvas.width, canvas.height) / 38));
+    const label = confidence === 'high' ? 'Grid detected' : 'Grid (low confidence)';
+    ctx.font     = `bold ${fs}px monospace`;
+    const tw     = ctx.measureText(label).width + 12;
+    const lx     = Math.max(rect.x, 4);
+    const ly     = rect.y > fs + 10 ? rect.y - 5 : rect.y + rect.height + fs + 7;
+    ctx.fillStyle = 'rgba(0,0,0,0.62)';
+    ctx.fillRect(lx, ly - fs - 2, tw, fs + 6);
+    ctx.fillStyle = confidence === 'high' ? '#4af' : '#fa0';
+    ctx.fillText(label, lx + 6, ly);
+
+    ctx.restore();
+}
+
+function drawFallback() {
+    const w = strokeW() + 1;
+    ctx.save();
+
+    // Dashed red border to indicate the full image is used as fallback
+    ctx.strokeStyle = '#ff3333';
+    ctx.lineWidth   = w;
+    ctx.setLineDash([14, 8]);
+    ctx.strokeRect(w, w, canvas.width - w * 2, canvas.height - w * 2);
+    ctx.setLineDash([]);
+
+    // Centred warning label
+    const fs  = Math.max(13, Math.round(Math.min(canvas.width, canvas.height) / 32));
+    const msg = 'No grid detected — full image bounds shown';
+    ctx.font   = `bold ${fs}px monospace`;
+    const tw   = ctx.measureText(msg).width + 16;
+    const lx   = Math.max((canvas.width  - tw) / 2, 4);
+    const ly   = canvas.height / 2;
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(lx, ly - fs - 4, tw, fs + 10);
+    ctx.fillStyle = '#ff3333';
+    ctx.fillText(msg, lx + 8, ly + 2);
+
+    ctx.restore();
+}
+
+function overlayError(msg) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(160,0,0,0.88)';
+    ctx.fillRect(0, 0, canvas.width, 36);
+    ctx.fillStyle = '#fff';
+    ctx.font      = '13px monospace';
+    ctx.fillText('Detection error: ' + msg, 8, 24);
+    ctx.restore();
+}
+
+// ---- Status panel ---------------------------------------------------
+
+function updateStatus(detected, rect, confidence, hLines, vLines) {
+    statusPanel.style.display = 'block';
+
+    const el = id => document.getElementById(id);
+
+    el('s-found').textContent = detected ? 'yes' : 'no';
+    el('s-found').className   = detected ? 'yes' : 'no';
+
+    el('s-dims').textContent   = rect ? `${rect.width} × ${rect.height} px` : 'N/A';
+    el('s-origin').textContent = rect ? `${rect.x}, ${rect.y}` : 'N/A';
+
+    el('s-conf').textContent = detected ? confidence : 'N/A';
+    el('s-conf').className   = detected ? confidence : '';
+
+    el('s-lines').textContent = `${hLines} / ${vLines}`;
+}
+</script>
+
+<!--
+    OpenCV.js loaded asynchronously from the official CDN.
+    The WASM binary initialises after the JS is parsed, so onOpenCvReady()
+    defers enabling the UI until cv.onRuntimeInitialized fires.
+    If you need offline use, download opencv.js and change the src to a local path.
+-->
+<script async
+    src="https://docs.opencv.org/4.8.0/opencv.js"
+    onload="onOpenCvReady()"
+    onerror="setCvStatus('error', 'Failed to load OpenCV.js — check network connection')">
+</script>
+
+</body>
+</html>
