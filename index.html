@@ -195,6 +195,13 @@ const FOV_ERODE_FRAC   = 0.06; // Shrink the bright field-of-view mask inward by
                                //   fraction of the image's smaller side. The aperture
                                //   rim is the biggest source of false circles, so we
                                //   exclude a ring this thick around the edge.
+const LINE_BRIGHT_DELTA = 32;  // Grayscale levels above the field's mean brightness that
+                               //   count as a bright grid line. Those pixels are flattened
+                               //   before the circle search so the white grid rulings stop
+                               //   spawning false cells. Lower → removes fainter lines too
+                               //   (risk: also removes bright cells).
+const LINE_DILATE_FRAC = 0.004;// Dilate the grid-line mask by this fraction of the smaller
+                               //   side so the soft shoulders beside each line are covered.
 
 // =====================================================================
 
@@ -460,12 +467,14 @@ function runDetection() {
  * @returns {Array<{x:number, y:number, r:number}>}
  */
 function detectCells(blurred) {
-    const out     = [];
-    const mask    = new cv.Mat();
-    const masked  = new cv.Mat();
-    const inv     = new cv.Mat();
-    const circles = new cv.Mat();
-    let   erodeK  = null;
+    const out      = [];
+    const mask     = new cv.Mat();
+    const masked   = new cv.Mat();
+    const inv      = new cv.Mat();
+    const lineMask = new cv.Mat();
+    const circles  = new cv.Mat();
+    let   erodeK   = null;
+    let   lineK    = null;
 
     try {
         // Field-of-view mask: lit aperture (bright) vs dark surround. Otsu finds
@@ -480,11 +489,22 @@ function detectCells(blurred) {
         erodeK = cv.Mat.ones(k, k, cv.CV_8U);
         cv.erode(mask, mask, erodeK, new cv.Point(-1, -1), 1);
 
-        // Flatten everything outside the eroded mask to the field's mean grey, so
-        // neither the dark surround nor the rim contributes any edges.
+        const m = cv.mean(blurred, mask);   // mean brightness inside the field
+
+        // Grid-line mask: pixels well above the field mean are the bright white
+        // rulings. Dilate to also cover their soft edges, then fold them into the
+        // exclusion mask so they don't spawn false circles.
+        cv.threshold(blurred, lineMask, m[0] + LINE_BRIGHT_DELTA, 255, cv.THRESH_BINARY);
+        let lk = Math.max(3, Math.round(minSide * LINE_DILATE_FRAC));
+        if (lk % 2 === 0) lk += 1;
+        lineK = cv.Mat.ones(lk, lk, cv.CV_8U);
+        cv.dilate(lineMask, lineMask, lineK, new cv.Point(-1, -1), 1);
+
+        // Flatten everything outside the eroded field mask AND every bright grid
+        // line to the field's mean grey, so only the clean interior has edges.
         blurred.copyTo(masked);
         cv.bitwise_not(mask, inv);
-        const m = cv.mean(blurred, mask);   // mean brightness inside the field
+        cv.bitwise_or(inv, lineMask, inv);
         masked.setTo(new cv.Scalar(m[0]), inv);
 
         cv.HoughCircles(masked, circles, cv.HOUGH_GRADIENT,
@@ -501,7 +521,7 @@ function detectCells(blurred) {
             });
         }
     } finally {
-        sdel(circles, mask, masked, inv, erodeK);
+        sdel(circles, mask, masked, inv, lineMask, erodeK, lineK);
     }
     return out;
 }
