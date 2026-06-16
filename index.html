@@ -185,9 +185,13 @@ const CIRCLE_MIN_DIST  = 14;   // Minimum distance between detected circle centr
 const CIRCLE_PARAM1    = 60;   // Upper Canny threshold used internally by HoughCircles
                                //   Lowered so the faint, low-contrast cell rings
                                //   still register as edges.
-const CIRCLE_PARAM2    = 26;   // Accumulator threshold for centre detection
+const CIRCLE_PARAM2    = 18;   // Accumulator threshold for centre detection
                                //   LOWER → more circles (and more false positives).
                                //   This is the #1 knob if cells aren't being detected.
+const CLAHE_CLIP       = 3.0;  // Contrast-limited adaptive histogram equalisation clip
+                               //   limit. Boosts the faint, low-contrast cell rings so
+                               //   HoughCircles can see them. Higher → more contrast/noise.
+const CLAHE_TILES      = 8;    // CLAHE tile grid size (CLAHE_TILES × CLAHE_TILES).
 const CIRCLE_MIN_R     = 6;    // Minimum cell radius (px) — 0 = no minimum
 const CIRCLE_MAX_R     = 38;   // Maximum cell radius (px) — 0 = no maximum
                                //   Capped so large grid squares aren't read as cells.
@@ -468,17 +472,24 @@ function runDetection() {
  */
 function detectCells(blurred) {
     const out      = [];
+    const enh      = new cv.Mat();
     const mask     = new cv.Mat();
     const masked   = new cv.Mat();
     const inv      = new cv.Mat();
     const lineMask = new cv.Mat();
     const circles  = new cv.Mat();
+    let   clahe    = null;
     let   erodeK   = null;
     let   lineK    = null;
 
     try {
+        // Boost the faint, low-contrast cell rings so HoughCircles can see them.
+        clahe = new cv.CLAHE(CLAHE_CLIP, new cv.Size(CLAHE_TILES, CLAHE_TILES));
+        clahe.apply(blurred, enh);
+
         // Field-of-view mask: lit aperture (bright) vs dark surround. Otsu finds
-        // the split automatically regardless of exposure.
+        // the split automatically regardless of exposure. (Built from the original
+        // blurred image — the dark surround is unambiguous before equalisation.)
         cv.threshold(blurred, mask, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
 
         // Erode inward so the bright rim ring is excluded from the search.
@@ -489,12 +500,12 @@ function detectCells(blurred) {
         erodeK = cv.Mat.ones(k, k, cv.CV_8U);
         cv.erode(mask, mask, erodeK, new cv.Point(-1, -1), 1);
 
-        const m = cv.mean(blurred, mask);   // mean brightness inside the field
+        const m = cv.mean(enh, mask);       // mean brightness inside the field
 
         // Grid-line mask: pixels well above the field mean are the bright white
         // rulings. Dilate to also cover their soft edges, then fold them into the
         // exclusion mask so they don't spawn false circles.
-        cv.threshold(blurred, lineMask, m[0] + LINE_BRIGHT_DELTA, 255, cv.THRESH_BINARY);
+        cv.threshold(enh, lineMask, m[0] + LINE_BRIGHT_DELTA, 255, cv.THRESH_BINARY);
         let lk = Math.max(3, Math.round(minSide * LINE_DILATE_FRAC));
         if (lk % 2 === 0) lk += 1;
         lineK = cv.Mat.ones(lk, lk, cv.CV_8U);
@@ -502,7 +513,7 @@ function detectCells(blurred) {
 
         // Flatten everything outside the eroded field mask AND every bright grid
         // line to the field's mean grey, so only the clean interior has edges.
-        blurred.copyTo(masked);
+        enh.copyTo(masked);
         cv.bitwise_not(mask, inv);
         cv.bitwise_or(inv, lineMask, inv);
         masked.setTo(new cv.Scalar(m[0]), inv);
@@ -521,7 +532,7 @@ function detectCells(blurred) {
             });
         }
     } finally {
-        sdel(circles, mask, masked, inv, lineMask, erodeK, lineK);
+        sdel(circles, enh, mask, masked, inv, lineMask, erodeK, lineK, clahe);
     }
     return out;
 }
