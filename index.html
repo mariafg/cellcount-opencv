@@ -185,12 +185,16 @@ const CIRCLE_MIN_DIST  = 14;   // Minimum distance between detected circle centr
 const CIRCLE_PARAM1    = 60;   // Upper Canny threshold used internally by HoughCircles
                                //   Lowered so the faint, low-contrast cell rings
                                //   still register as edges.
-const CIRCLE_PARAM2    = 16;   // Accumulator threshold for centre detection
+const CIRCLE_PARAM2    = 26;   // Accumulator threshold for centre detection
                                //   LOWER → more circles (and more false positives).
                                //   This is the #1 knob if cells aren't being detected.
-const CIRCLE_MIN_R     = 4;    // Minimum cell radius (px) — 0 = no minimum
-const CIRCLE_MAX_R     = 40;   // Maximum cell radius (px) — 0 = no maximum
+const CIRCLE_MIN_R     = 6;    // Minimum cell radius (px) — 0 = no minimum
+const CIRCLE_MAX_R     = 38;   // Maximum cell radius (px) — 0 = no maximum
                                //   Capped so large grid squares aren't read as cells.
+const FOV_ERODE_FRAC   = 0.06; // Shrink the bright field-of-view mask inward by this
+                               //   fraction of the image's smaller side. The aperture
+                               //   rim is the biggest source of false circles, so we
+                               //   exclude a ring this thick around the edge.
 
 // =====================================================================
 
@@ -422,7 +426,7 @@ function runDetection() {
         // than the grid box: grid detection can be unreliable on broken/cut-off
         // grids, and the dark area outside the field of view yields no circles
         // anyway, so whole-image search maximises how many cells we catch.
-        const cellCircles = detectCells(blurred, null);
+        const cellCircles = detectCells(blurred);
 
         // ── Step 4: Render results ────────────────────────────────────
         const detected   = gridRect !== null;
@@ -445,29 +449,45 @@ function runDetection() {
 
 /**
  * Detect circular cells with the Hough gradient transform.
- * @param {cv.Mat}  blurred  Blurred single-channel grayscale image.
- * @param {?object} roiRect  Optional {x,y,width,height} to limit the search;
- *                           coordinates of returned circles are mapped back to
- *                           full-image space.
+ *
+ * The bright circular field of view (microscope aperture) is the dominant
+ * source of false circles, so before searching we build a mask of the lit
+ * area, erode it well inside the rim, and flatten everything outside that mask
+ * to the field's mean brightness — removing both the rim edge and the dark
+ * surround so HoughCircles only ever sees the clean interior.
+ *
+ * @param {cv.Mat} blurred  Blurred single-channel (8-bit) grayscale image.
  * @returns {Array<{x:number, y:number, r:number}>}
  */
-function detectCells(blurred, roiRect) {
+function detectCells(blurred) {
     const out     = [];
+    const mask    = new cv.Mat();
+    const masked  = new cv.Mat();
+    const inv     = new cv.Mat();
     const circles = new cv.Mat();
-    let   region  = blurred;
-    let   roi     = null;
-    let   oX = 0, oY = 0;
+    let   erodeK  = null;
 
     try {
-        if (roiRect) {
-            roi    = blurred.roi(
-                new cv.Rect(roiRect.x, roiRect.y, roiRect.width, roiRect.height));
-            region = roi;
-            oX = roiRect.x;
-            oY = roiRect.y;
-        }
+        // Field-of-view mask: lit aperture (bright) vs dark surround. Otsu finds
+        // the split automatically regardless of exposure.
+        cv.threshold(blurred, mask, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
 
-        cv.HoughCircles(region, circles, cv.HOUGH_GRADIENT,
+        // Erode inward so the bright rim ring is excluded from the search.
+        const minSide = Math.min(blurred.cols, blurred.rows);
+        let k = Math.round(minSide * FOV_ERODE_FRAC);
+        if (k % 2 === 0) k += 1;            // kernel size must be odd
+        k = Math.max(3, k);
+        erodeK = cv.Mat.ones(k, k, cv.CV_8U);
+        cv.erode(mask, mask, erodeK, new cv.Point(-1, -1), 1);
+
+        // Flatten everything outside the eroded mask to the field's mean grey, so
+        // neither the dark surround nor the rim contributes any edges.
+        blurred.copyTo(masked);
+        cv.bitwise_not(mask, inv);
+        const m = cv.mean(blurred, mask);   // mean brightness inside the field
+        masked.setTo(new cv.Scalar(m[0]), inv);
+
+        cv.HoughCircles(masked, circles, cv.HOUGH_GRADIENT,
             CIRCLE_DP, CIRCLE_MIN_DIST,
             CIRCLE_PARAM1, CIRCLE_PARAM2, CIRCLE_MIN_R, CIRCLE_MAX_R);
 
@@ -475,13 +495,13 @@ function detectCells(blurred, roiRect) {
         // the COLUMNS (circles.cols), not the rows. Each holds [x, y, radius].
         for (let i = 0; i < circles.cols; i++) {
             out.push({
-                x: circles.data32F[i * 3]     + oX,
-                y: circles.data32F[i * 3 + 1] + oY,
+                x: circles.data32F[i * 3],
+                y: circles.data32F[i * 3 + 1],
                 r: circles.data32F[i * 3 + 2],
             });
         }
     } finally {
-        sdel(circles, roi);
+        sdel(circles, mask, masked, inv, erodeK);
     }
     return out;
 }
