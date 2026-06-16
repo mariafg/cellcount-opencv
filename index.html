@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hemocytometer Grid Detector</title>
+<title>Hemocytometer Grid &amp; Cell Detector</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -100,8 +100,8 @@ td:first-child { color: #555; width: 200px; flex-shrink: 0; }
 </head>
 <body>
 
-<h1>Hemocytometer Grid Detector</h1>
-<p class="subtitle">Detects and outlines the counting grid using OpenCV.js contour + Hough line detection</p>
+<h1>Hemocytometer Grid &amp; Cell Detector</h1>
+<p class="subtitle">Outlines the counting grid (contour + Hough lines) and counts circular cells (Hough circle transform) using OpenCV.js</p>
 
 <div class="controls">
     <label class="file-label" for="file-input">Choose image (jpg / png)</label>
@@ -123,6 +123,7 @@ td:first-child { color: #555; width: 200px; flex-shrink: 0; }
         <tr><td>Grid origin (x, y)</td><td id="s-origin">—</td></tr>
         <tr><td>Confidence</td>        <td id="s-conf">—</td></tr>
         <tr><td>Internal lines H / V</td><td id="s-lines">—</td></tr>
+        <tr><td>Cells counted</td>      <td id="s-cells">—</td></tr>
     </table>
 </div>
 
@@ -166,6 +167,18 @@ const HOUGH_MAX_GAP = 15;           // Maximum collinear gap to join segments (p
 // Confidence scoring
 const ANGLE_TOL_DEG  = 15;  // Degrees from horizontal/vertical to classify a line
 const MIN_LINES_CONF =  4;  // Minimum H AND V lines inside the grid for "high" confidence
+
+// HoughCircles — circular cell detection (cv.HOUGH_GRADIENT)
+const CIRCLE_DP        = 1.2;  // Inverse accumulator resolution ratio
+                               //   1 = full res; raise (1.5–2) if no circles are found
+const CIRCLE_MIN_DIST  = 18;   // Minimum distance between detected circle centres (px)
+                               //   Lower to separate touching/clustered cells
+const CIRCLE_PARAM1    = 100;  // Upper Canny threshold used internally by HoughCircles
+const CIRCLE_PARAM2    = 22;   // Accumulator threshold for centre detection
+                               //   LOWER → more circles (and more false positives).
+                               //   This is the #1 knob if cells aren't being detected.
+const CIRCLE_MIN_R     = 6;    // Minimum cell radius (px) — 0 = no minimum
+const CIRCLE_MAX_R     = 55;   // Maximum cell radius (px) — 0 = no maximum
 
 // =====================================================================
 
@@ -373,6 +386,12 @@ function runDetection() {
             gridRect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
         }
 
+        // ── Step 3b: HoughCircles to detect & count circular cells ────
+        // Runs on the blurred grayscale (NOT the edge map — HOUGH_GRADIENT
+        // computes its own Canny internally). If a grid was found we restrict
+        // the search to it so debris outside the chamber isn't counted.
+        const cellCircles = detectCells(blurred, bestRect);
+
         // ── Step 4: Render results ────────────────────────────────────
         const detected   = gridRect !== null;
         const highConf   = hCount >= MIN_LINES_CONF && vCount >= MIN_LINES_CONF;
@@ -381,12 +400,58 @@ function runDetection() {
         if (detected) drawOverlay(bestApprox, gridRect, confidence);
         else          drawFallback();
 
-        updateStatus(detected, gridRect, confidence, hCount, vCount);
+        drawCells(cellCircles);
+        updateStatus(detected, gridRect, confidence, hCount, vCount, cellCircles.length);
 
     } finally {
         sdel(src, gray, blurred, edges, dilated, kernel, hier, lines, bestApprox);
         sdel(contours);
     }
+}
+
+// ---- Cell (circle) detection ----------------------------------------
+
+/**
+ * Detect circular cells with the Hough gradient transform.
+ * @param {cv.Mat}  blurred  Blurred single-channel grayscale image.
+ * @param {?object} roiRect  Optional {x,y,width,height} to limit the search;
+ *                           coordinates of returned circles are mapped back to
+ *                           full-image space.
+ * @returns {Array<{x:number, y:number, r:number}>}
+ */
+function detectCells(blurred, roiRect) {
+    const out     = [];
+    const circles = new cv.Mat();
+    let   region  = blurred;
+    let   roi     = null;
+    let   oX = 0, oY = 0;
+
+    try {
+        if (roiRect) {
+            roi    = blurred.roi(
+                new cv.Rect(roiRect.x, roiRect.y, roiRect.width, roiRect.height));
+            region = roi;
+            oX = roiRect.x;
+            oY = roiRect.y;
+        }
+
+        cv.HoughCircles(region, circles, cv.HOUGH_GRADIENT,
+            CIRCLE_DP, CIRCLE_MIN_DIST,
+            CIRCLE_PARAM1, CIRCLE_PARAM2, CIRCLE_MIN_R, CIRCLE_MAX_R);
+
+        // HoughCircles returns a 1-row, N-column CV_32FC3 Mat: the circles are
+        // the COLUMNS (circles.cols), not the rows. Each holds [x, y, radius].
+        for (let i = 0; i < circles.cols; i++) {
+            out.push({
+                x: circles.data32F[i * 3]     + oX,
+                y: circles.data32F[i * 3 + 1] + oY,
+                r: circles.data32F[i * 3 + 2],
+            });
+        }
+    } finally {
+        sdel(circles, roi);
+    }
+    return out;
 }
 
 // ---- Rendering helpers ----------------------------------------------
@@ -445,6 +510,39 @@ function drawOverlay(approxMat, rect, confidence) {
     ctx.restore();
 }
 
+/** Outline each detected cell and stamp the running count. */
+function drawCells(cells) {
+    if (!cells.length) return;
+    const w = Math.max(1, Math.round(strokeW() * 0.6));
+    ctx.save();
+    ctx.strokeStyle = '#2dff7a';
+    ctx.lineWidth   = w;
+    ctx.fillStyle   = '#2dff7a';
+
+    const dot = Math.max(1, Math.round(w * 0.9));
+    for (const c of cells) {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, Math.max(c.r, 1), 0, 2 * Math.PI);
+        ctx.stroke();
+        // Centre marker
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, dot, 0, 2 * Math.PI);
+        ctx.fill();
+    }
+
+    // Count badge in the top-left corner
+    const fs    = Math.max(13, Math.round(Math.min(canvas.width, canvas.height) / 38));
+    const label = `${cells.length} cell${cells.length === 1 ? '' : 's'}`;
+    ctx.font     = `bold ${fs}px monospace`;
+    const tw     = ctx.measureText(label).width + 14;
+    ctx.fillStyle = 'rgba(0,0,0,0.62)';
+    ctx.fillRect(4, 4, tw, fs + 8);
+    ctx.fillStyle = '#2dff7a';
+    ctx.fillText(label, 11, fs + 8);
+
+    ctx.restore();
+}
+
 function drawFallback() {
     const w = strokeW() + 1;
     ctx.save();
@@ -483,7 +581,7 @@ function overlayError(msg) {
 
 // ---- Status panel ---------------------------------------------------
 
-function updateStatus(detected, rect, confidence, hLines, vLines) {
+function updateStatus(detected, rect, confidence, hLines, vLines, cellCount) {
     statusPanel.style.display = 'block';
 
     const el = id => document.getElementById(id);
@@ -498,6 +596,9 @@ function updateStatus(detected, rect, confidence, hLines, vLines) {
     el('s-conf').className   = detected ? confidence : '';
 
     el('s-lines').textContent = `${hLines} / ${vLines}`;
+
+    el('s-cells').textContent = `${cellCount}`;
+    el('s-cells').className    = cellCount > 0 ? 'high' : 'low';
 }
 </script>
 
