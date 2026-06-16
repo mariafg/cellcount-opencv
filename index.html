@@ -150,6 +150,11 @@ const DILATE_ITERS = 2;    // Edge dilation passes (odd kernel 3×3)
 const MIN_CONTOUR_AREA = 5000;  // Minimum area (px²) for a candidate region
                                  //   Raise for high-res images (e.g. 50 000 for 4 K)
                                  //   Lower if the grid fills only a small portion of the image
+const MIN_GRID_AREA_FRAC = 0.05; // A grid candidate must cover at least this fraction of
+                                 //   the whole image. Stops a single small grid CELL from
+                                 //   being mistaken for the whole grid; when the grid's
+                                 //   outer border is broken/cut off, detection instead
+                                 //   falls back to the Hough-line span (Step 3).
 const POLY_EPS_FACTOR  = 0.02;  // approxPolyDP tolerance as a fraction of the perimeter
                                  //   Range 0.01–0.05; higher accepts noisier outlines
 const MIN_ASPECT = 0.35;         // Minimum width÷height for a valid grid candidate
@@ -175,14 +180,17 @@ const MIN_LINES_CONF =  4;  // Minimum H AND V lines inside the grid for "high" 
 // HoughCircles — circular cell detection (cv.HOUGH_GRADIENT)
 const CIRCLE_DP        = 1.2;  // Inverse accumulator resolution ratio
                                //   1 = full res; raise (1.5–2) if no circles are found
-const CIRCLE_MIN_DIST  = 18;   // Minimum distance between detected circle centres (px)
+const CIRCLE_MIN_DIST  = 14;   // Minimum distance between detected circle centres (px)
                                //   Lower to separate touching/clustered cells
-const CIRCLE_PARAM1    = 100;  // Upper Canny threshold used internally by HoughCircles
-const CIRCLE_PARAM2    = 22;   // Accumulator threshold for centre detection
+const CIRCLE_PARAM1    = 60;   // Upper Canny threshold used internally by HoughCircles
+                               //   Lowered so the faint, low-contrast cell rings
+                               //   still register as edges.
+const CIRCLE_PARAM2    = 16;   // Accumulator threshold for centre detection
                                //   LOWER → more circles (and more false positives).
                                //   This is the #1 knob if cells aren't being detected.
-const CIRCLE_MIN_R     = 6;    // Minimum cell radius (px) — 0 = no minimum
-const CIRCLE_MAX_R     = 55;   // Maximum cell radius (px) — 0 = no maximum
+const CIRCLE_MIN_R     = 4;    // Minimum cell radius (px) — 0 = no minimum
+const CIRCLE_MAX_R     = 40;   // Maximum cell radius (px) — 0 = no maximum
+                               //   Capped so large grid squares aren't read as cells.
 
 // =====================================================================
 
@@ -338,7 +346,9 @@ function runDetection() {
                 const fill = rrA > 0 ? area / rrA : 0;
 
                 if (ar >= MIN_ASPECT && ar <= MAX_ASPECT
-                        && fill >= RECT_MIN_FILL && area > bestArea) {
+                        && fill >= RECT_MIN_FILL
+                        && area >= imgArea * MIN_GRID_AREA_FRAC
+                        && area > bestArea) {
                     bestArea = area;
                     // Store as plain object so we don't hold a cv.Rect reference
                     bestRect = { x: r.x, y: r.y, width: r.width, height: r.height };
@@ -408,9 +418,11 @@ function runDetection() {
 
         // ── Step 3b: HoughCircles to detect & count circular cells ────
         // Runs on the blurred grayscale (NOT the edge map — HOUGH_GRADIENT
-        // computes its own Canny internally). If a grid was found we restrict
-        // the search to it so debris outside the chamber isn't counted.
-        const cellCircles = detectCells(blurred, bestRect);
+        // computes its own Canny internally). Searches the WHOLE image rather
+        // than the grid box: grid detection can be unreliable on broken/cut-off
+        // grids, and the dark area outside the field of view yields no circles
+        // anyway, so whole-image search maximises how many cells we catch.
+        const cellCircles = detectCells(blurred, null);
 
         // ── Step 4: Render results ────────────────────────────────────
         const detected   = gridRect !== null;
