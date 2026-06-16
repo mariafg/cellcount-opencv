@@ -101,7 +101,7 @@ td:first-child { color: #555; width: 200px; flex-shrink: 0; }
 <body>
 
 <h1>Hemocytometer Grid &amp; Cell Detector</h1>
-<p class="subtitle">Outlines the counting grid (contour + Hough lines) and counts circular cells (Hough circle transform) using OpenCV.js</p>
+<p class="subtitle">Outlines the counting grid (contour + Hough lines) and counts cells (background-subtraction blob detection) using OpenCV.js</p>
 
 <div class="controls">
     <label class="file-label" for="file-input">Choose image (jpg / png)</label>
@@ -177,24 +177,21 @@ const HOUGH_MAX_GAP = 15;           // Maximum collinear gap to join segments (p
 const ANGLE_TOL_DEG  = 15;  // Degrees from horizontal/vertical to classify a line
 const MIN_LINES_CONF =  4;  // Minimum H AND V lines inside the grid for "high" confidence
 
-// HoughCircles — circular cell detection (cv.HOUGH_GRADIENT)
-const CIRCLE_DP        = 1.2;  // Inverse accumulator resolution ratio
-                               //   1 = full res; raise (1.5–2) if no circles are found
-const CIRCLE_MIN_DIST  = 14;   // Minimum distance between detected circle centres (px)
-                               //   Lower to separate touching/clustered cells
-const CIRCLE_PARAM1    = 60;   // Upper Canny threshold used internally by HoughCircles
-                               //   Lowered so the faint, low-contrast cell rings
-                               //   still register as edges.
-const CIRCLE_PARAM2    = 18;   // Accumulator threshold for centre detection
-                               //   LOWER → more circles (and more false positives).
-                               //   This is the #1 knob if cells aren't being detected.
-const CLAHE_CLIP       = 3.0;  // Contrast-limited adaptive histogram equalisation clip
-                               //   limit. Boosts the faint, low-contrast cell rings so
-                               //   HoughCircles can see them. Higher → more contrast/noise.
-const CLAHE_TILES      = 8;    // CLAHE tile grid size (CLAHE_TILES × CLAHE_TILES).
-const CIRCLE_MIN_R     = 6;    // Minimum cell radius (px) — 0 = no minimum
-const CIRCLE_MAX_R     = 38;   // Maximum cell radius (px) — 0 = no maximum
-                               //   Capped so large grid squares aren't read as cells.
+// Blob-based cell detection
+//   Cells are found as dark spots that stand out from the local background, then
+//   filtered by size and roundness. This is far more controllable than a Hough
+//   circle vote on a noisy, low-contrast field.
+const BG_BLUR_FRAC   = 0.04; // Background illumination is estimated by a large blur this
+                             //   wide (fraction of the smaller side) and subtracted, so
+                             //   only local dark spots (cells) survive — not the smooth
+                             //   orange gradient or uneven lighting.
+const CELL_DARK_DELTA = 8;   // How much darker than the local background (0–255) a pixel
+                             //   must be to belong to a cell. LOWER → catches fainter
+                             //   cells (and more noise); the main sensitivity knob.
+const CELL_MIN_AREA   = 30;  // Minimum blob area (px²). Smaller blobs are speckle noise.
+const CELL_MAX_AREA   = 2500;// Maximum blob area (px²). Larger blobs are debris or clumps.
+const CELL_MIN_CIRC   = 0.55;// Minimum circularity 4πA/P² (1 = perfect circle). Rejects
+                             //   line fragments, scratches and irregular debris.
 const FOV_ERODE_FRAC   = 0.06; // Shrink the bright field-of-view mask inward by this
                                //   fraction of the image's smaller side. The aperture
                                //   rim is the biggest source of false circles, so we
@@ -431,12 +428,11 @@ function runDetection() {
             gridRect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
         }
 
-        // ── Step 3b: HoughCircles to detect & count circular cells ────
-        // Runs on the blurred grayscale (NOT the edge map — HOUGH_GRADIENT
-        // computes its own Canny internally). Searches the WHOLE image rather
-        // than the grid box: grid detection can be unreliable on broken/cut-off
-        // grids, and the dark area outside the field of view yields no circles
-        // anyway, so whole-image search maximises how many cells we catch.
+        // ── Step 3b: blob detection to find & count cells ─────────────
+        // Cells are found as dark spots standing out from the local background
+        // (see detectCells), filtered by size and roundness. Runs on the whole
+        // image — grid detection can be unreliable, and the masking inside
+        // detectCells already excludes the rim, surround and grid lines.
         const cellCircles = detectCells(blurred);
 
         // ── Step 4: Render results ────────────────────────────────────
@@ -459,80 +455,94 @@ function runDetection() {
 // ---- Cell (circle) detection ----------------------------------------
 
 /**
- * Detect circular cells with the Hough gradient transform.
+ * Detect cells as dark blobs that stand out from the local background, filtered
+ * by size and roundness.
  *
- * The bright circular field of view (microscope aperture) is the dominant
- * source of false circles, so before searching we build a mask of the lit
- * area, erode it well inside the rim, and flatten everything outside that mask
- * to the field's mean brightness — removing both the rim edge and the dark
- * surround so HoughCircles only ever sees the clean interior.
+ * Pipeline:
+ *   1. Build a field-of-view mask (lit aperture), eroded inward so the bright
+ *      rim is excluded, and a bright grid-line mask. Their union is the area to
+ *      ignore — the rim and rulings are the main false-positive sources.
+ *   2. Estimate background illumination with a large blur and subtract it, so
+ *      only local dark spots (cells) remain, not the smooth orange gradient.
+ *   3. Threshold that darkness map, restrict it to the allowed area, and clean
+ *      up speckle.
+ *   4. Find contours and keep those whose area and circularity look cell-like.
  *
  * @param {cv.Mat} blurred  Blurred single-channel (8-bit) grayscale image.
  * @returns {Array<{x:number, y:number, r:number}>}
  */
 function detectCells(blurred) {
     const out      = [];
-    const enh      = new cv.Mat();
     const mask     = new cv.Mat();
-    const masked   = new cv.Mat();
-    const inv      = new cv.Mat();
     const lineMask = new cv.Mat();
-    const circles  = new cv.Mat();
-    let   clahe    = null;
+    const allow    = new cv.Mat();
+    const bg       = new cv.Mat();
+    const dark     = new cv.Mat();
+    const bin      = new cv.Mat();
+    const contours = new cv.MatVector();
+    const hier     = new cv.Mat();
     let   erodeK   = null;
-    let   lineK    = null;
+    let   openK    = null;
 
     try {
-        // Boost the faint, low-contrast cell rings so HoughCircles can see them.
-        clahe = new cv.CLAHE(CLAHE_CLIP, new cv.Size(CLAHE_TILES, CLAHE_TILES));
-        clahe.apply(blurred, enh);
-
-        // Field-of-view mask: lit aperture (bright) vs dark surround. Otsu finds
-        // the split automatically regardless of exposure. (Built from the original
-        // blurred image — the dark surround is unambiguous before equalisation.)
-        cv.threshold(blurred, mask, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-
-        // Erode inward so the bright rim ring is excluded from the search.
         const minSide = Math.min(blurred.cols, blurred.rows);
+
+        // ── Field-of-view mask, eroded inward to drop the bright rim ──
+        cv.threshold(blurred, mask, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
         let k = Math.round(minSide * FOV_ERODE_FRAC);
-        if (k % 2 === 0) k += 1;            // kernel size must be odd
+        if (k % 2 === 0) k += 1;
         k = Math.max(3, k);
         erodeK = cv.Mat.ones(k, k, cv.CV_8U);
         cv.erode(mask, mask, erodeK, new cv.Point(-1, -1), 1);
 
-        const m = cv.mean(enh, mask);       // mean brightness inside the field
+        const m = cv.mean(blurred, mask);   // mean brightness inside the field
 
-        // Grid-line mask: pixels well above the field mean are the bright white
-        // rulings. Dilate to also cover their soft edges, then fold them into the
-        // exclusion mask so they don't spawn false circles.
-        cv.threshold(enh, lineMask, m[0] + LINE_BRIGHT_DELTA, 255, cv.THRESH_BINARY);
+        // ── Bright grid-line mask ──
+        cv.threshold(blurred, lineMask, m[0] + LINE_BRIGHT_DELTA, 255, cv.THRESH_BINARY);
         let lk = Math.max(3, Math.round(minSide * LINE_DILATE_FRAC));
         if (lk % 2 === 0) lk += 1;
-        lineK = cv.Mat.ones(lk, lk, cv.CV_8U);
-        cv.dilate(lineMask, lineMask, lineK, new cv.Point(-1, -1), 1);
+        openK = cv.Mat.ones(lk, lk, cv.CV_8U);
+        cv.dilate(lineMask, lineMask, openK, new cv.Point(-1, -1), 1);
 
-        // Flatten everything outside the eroded field mask AND every bright grid
-        // line to the field's mean grey, so only the clean interior has edges.
-        enh.copyTo(masked);
-        cv.bitwise_not(mask, inv);
-        cv.bitwise_or(inv, lineMask, inv);
-        masked.setTo(new cv.Scalar(m[0]), inv);
+        // allow = field interior AND NOT grid line
+        cv.bitwise_not(lineMask, allow);
+        cv.bitwise_and(mask, allow, allow);
 
-        cv.HoughCircles(masked, circles, cv.HOUGH_GRADIENT,
-            CIRCLE_DP, CIRCLE_MIN_DIST,
-            CIRCLE_PARAM1, CIRCLE_PARAM2, CIRCLE_MIN_R, CIRCLE_MAX_R);
+        // ── Background subtraction: keep only local dark spots ──
+        let bk = Math.round(minSide * BG_BLUR_FRAC);
+        if (bk % 2 === 0) bk += 1;
+        bk = Math.max(3, bk);
+        cv.GaussianBlur(blurred, bg, new cv.Size(bk, bk), 0);
+        cv.subtract(bg, blurred, dark);     // bright where image is darker than background
 
-        // HoughCircles returns a 1-row, N-column CV_32FC3 Mat: the circles are
-        // the COLUMNS (circles.cols), not the rows. Each holds [x, y, radius].
-        for (let i = 0; i < circles.cols; i++) {
-            out.push({
-                x: circles.data32F[i * 3],
-                y: circles.data32F[i * 3 + 1],
-                r: circles.data32F[i * 3 + 2],
-            });
+        // ── Threshold + restrict to the allowed area + de-speckle ──
+        cv.threshold(dark, bin, CELL_DARK_DELTA, 255, cv.THRESH_BINARY);
+        cv.bitwise_and(bin, allow, bin);
+        cv.morphologyEx(bin, bin, cv.MORPH_OPEN,
+            cv.Mat.ones(3, 3, cv.CV_8U), new cv.Point(-1, -1), 1);
+
+        // ── Contour analysis: keep cell-like blobs ──
+        cv.findContours(bin, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        for (let i = 0; i < contours.size(); i++) {
+            const c    = contours.get(i);
+            const area = cv.contourArea(c);
+            if (area >= CELL_MIN_AREA && area <= CELL_MAX_AREA) {
+                const peri = cv.arcLength(c, true);
+                const circ = peri > 0 ? (4 * Math.PI * area) / (peri * peri) : 0;
+                if (circ >= CELL_MIN_CIRC) {
+                    const mo = cv.moments(c);
+                    out.push({
+                        x: mo.m00 ? mo.m10 / mo.m00 : 0,
+                        y: mo.m00 ? mo.m01 / mo.m00 : 0,
+                        r: Math.sqrt(area / Math.PI),
+                    });
+                }
+            }
+            c.delete();
         }
     } finally {
-        sdel(circles, enh, mask, masked, inv, lineMask, erodeK, lineK, clahe);
+        sdel(mask, lineMask, allow, bg, dark, bin, hier, erodeK, openK);
+        sdel(contours);
     }
     return out;
 }
