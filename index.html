@@ -154,6 +154,10 @@ const POLY_EPS_FACTOR  = 0.02;  // approxPolyDP tolerance as a fraction of the p
                                  //   Range 0.01–0.05; higher accepts noisier outlines
 const MIN_ASPECT = 0.35;         // Minimum width÷height for a valid grid candidate
 const MAX_ASPECT = 2.85;         // Maximum width÷height for a valid grid candidate
+const RECT_MIN_FILL = 0.82;      // Min (contour area ÷ min-area-rect area) to count as
+                                 //   a rectangle. A true square ≈ 1.0; a circular field
+                                 //   of view only fills ≈ 0.785, so this rejects the
+                                 //   bright microscope aperture from being read as a grid.
 
 // HoughLinesP — probabilistic Hough transform for internal line detection
 const HOUGH_RHO     = 1;            // Distance accumulator resolution (pixels)
@@ -293,8 +297,12 @@ function runDetection() {
         cv.dilate(edges, dilated, kernel, new cv.Point(-1, -1), DILATE_ITERS);
 
         // ── Step 2: Find largest rectangular contour ──────────────────
+        // RETR_LIST (not RETR_EXTERNAL): on a microscope image the grid is
+        // nested INSIDE the bright circular field of view, so it is a child
+        // contour. RETR_EXTERNAL would only ever return the outer circle and
+        // never reach the grid square.
         cv.findContours(dilated, contours, hier,
-            cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+            cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
 
         const imgArea = canvas.width * canvas.height;
         let bestArea  = 0;
@@ -314,11 +322,23 @@ function runDetection() {
             cv.approxPolyDP(c, approx, POLY_EPS_FACTOR * peri, true);
             c.delete();
 
-            // Accept 4–8 vertex polygons (covers slight perspective distortion)
-            if (approx.rows >= 4 && approx.rows <= 8) {
+            // A hemocytometer grid is a convex quadrilateral. Perspective tilt
+            // keeps it at 4 vertices — it's rounded shapes (like the circular
+            // field of view) that approximate to 5+ vertices, so insist on
+            // exactly 4 and on convexity to reject the aperture and debris.
+            if (approx.rows === 4 && cv.isContourConvex(approx)) {
                 const r  = cv.boundingRect(approx);
                 const ar = r.width / r.height;
-                if (ar >= MIN_ASPECT && ar <= MAX_ASPECT && area > bestArea) {
+
+                // Rectangularity: how completely the contour fills its (rotation
+                // invariant) minimum-area bounding box. Squares ≈ 1; a circle that
+                // slipped through as a quad would score ≈ 0.785 and be rejected.
+                const rr   = cv.minAreaRect(approx);
+                const rrA  = rr.size.width * rr.size.height;
+                const fill = rrA > 0 ? area / rrA : 0;
+
+                if (ar >= MIN_ASPECT && ar <= MAX_ASPECT
+                        && fill >= RECT_MIN_FILL && area > bestArea) {
                     bestArea = area;
                     // Store as plain object so we don't hold a cv.Rect reference
                     bestRect = { x: r.x, y: r.y, width: r.width, height: r.height };
