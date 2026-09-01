@@ -96,12 +96,42 @@ td:first-child { color: #555; width: 200px; flex-shrink: 0; }
 .no   { color: #f44; }
 .high { color: #4c4; }
 .low  { color: #fa0; }
+
+#tuning {
+    margin-top: 16px;
+    background: #171717;
+    border: 1px solid #2a2a2a;
+    border-radius: 3px;
+    padding: 14px 18px;
+    max-width: 520px;
+    display: none;
+}
+#tuning h2 {
+    font-size: 0.75em;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #444;
+    margin-bottom: 12px;
+}
+.slider-row { margin-bottom: 14px; }
+.slider-row label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8em;
+    color: #aaa;
+    margin-bottom: 5px;
+}
+.slider-row label .val { color: #4af; }
+.slider-row input[type="range"] { width: 100%; accent-color: #4af; }
+.mask-row { display: flex; align-items: center; gap: 8px; font-size: 0.82em; color: #aaa; }
+.mask-row input { accent-color: #2dff7a; width: 18px; height: 18px; }
+#tuning .hint { font-size: 0.72em; color: #555; margin-top: 6px; line-height: 1.4; }
 </style>
 </head>
 <body>
 
 <h1>Hemocytometer Grid &amp; Cell Detector</h1>
-<p class="subtitle">Outlines the counting grid (contour + Hough lines) and counts cells (background-subtraction blob detection) using OpenCV.js</p>
+<p class="subtitle">Outlines the counting grid (contour + Hough lines) and counts cells (background-subtraction blob detection). Use the sliders to tune detection live.</p>
 
 <div class="controls">
     <label class="file-label" for="file-input">Choose image (jpg / png)</label>
@@ -125,6 +155,34 @@ td:first-child { color: #555; width: 200px; flex-shrink: 0; }
         <tr><td>Internal lines H / V</td><td id="s-lines">—</td></tr>
         <tr><td>Cells counted</td>      <td id="s-cells">—</td></tr>
     </table>
+</div>
+
+<div id="tuning">
+    <h2>Cell detection — tune live</h2>
+
+    <div class="slider-row">
+        <label>Sensitivity (lower = more cells) <span class="val" id="v-delta">8</span></label>
+        <input type="range" id="sl-delta" min="2" max="40" step="1" value="8">
+    </div>
+    <div class="slider-row">
+        <label>Min cell size (px²) <span class="val" id="v-min">30</span></label>
+        <input type="range" id="sl-min" min="5" max="400" step="5" value="30">
+    </div>
+    <div class="slider-row">
+        <label>Max cell size (px²) <span class="val" id="v-max">2500</span></label>
+        <input type="range" id="sl-max" min="200" max="8000" step="100" value="2500">
+    </div>
+    <div class="slider-row">
+        <label>Roundness (higher = stricter) <span class="val" id="v-circ">0.55</span></label>
+        <input type="range" id="sl-circ" min="0" max="0.95" step="0.05" value="0.55">
+    </div>
+
+    <div class="mask-row">
+        <input type="checkbox" id="cb-mask">
+        <label for="cb-mask">Show detection mask (green = what's being counted)</label>
+    </div>
+    <p class="hint">Adjust a slider and the image re-analyses automatically. Turn on the
+        mask to see exactly which blobs are picked up, then tune until it matches the cells.</p>
 </div>
 
 <!-- hidden image element holds the original for redraw on re-analyse -->
@@ -177,20 +235,21 @@ const HOUGH_MAX_GAP = 15;           // Maximum collinear gap to join segments (p
 const ANGLE_TOL_DEG  = 15;  // Degrees from horizontal/vertical to classify a line
 const MIN_LINES_CONF =  4;  // Minimum H AND V lines inside the grid for "high" confidence
 
-// Blob-based cell detection
-//   Cells are found as dark spots that stand out from the local background, then
-//   filtered by size and roundness. This is far more controllable than a Hough
-//   circle vote on a noisy, low-contrast field.
+// Blob-based cell detection  (all four CELL_* values are live-editable via the
+//   on-page sliders — the constants below are just the starting defaults)
+//   Cells are found as spots that stand out from the local background in EITHER
+//   direction (light-centred rings or dark bodies), then filtered by size and
+//   roundness. Far more controllable than a Hough circle vote on a noisy field.
 const BG_BLUR_FRAC   = 0.04; // Background illumination is estimated by a large blur this
                              //   wide (fraction of the smaller side) and subtracted, so
-                             //   only local dark spots (cells) survive — not the smooth
+                             //   only local spots (cells) survive — not the smooth
                              //   orange gradient or uneven lighting.
-const CELL_DARK_DELTA = 8;   // How much darker than the local background (0–255) a pixel
-                             //   must be to belong to a cell. LOWER → catches fainter
-                             //   cells (and more noise); the main sensitivity knob.
-const CELL_MIN_AREA   = 30;  // Minimum blob area (px²). Smaller blobs are speckle noise.
-const CELL_MAX_AREA   = 2500;// Maximum blob area (px²). Larger blobs are debris or clumps.
-const CELL_MIN_CIRC   = 0.55;// Minimum circularity 4πA/P² (1 = perfect circle). Rejects
+let CELL_DARK_DELTA = 8;     // How far a pixel must deviate from the local background
+                             //   (0–255, either lighter or darker) to belong to a cell.
+                             //   LOWER → catches fainter cells (and more noise). Main knob.
+let CELL_MIN_AREA   = 30;    // Minimum blob area (px²). Smaller blobs are speckle noise.
+let CELL_MAX_AREA   = 2500;  // Maximum blob area (px²). Larger blobs are debris or clumps.
+let CELL_MIN_CIRC   = 0.55;  // Minimum circularity 4πA/P² (1 = perfect circle). Rejects
                              //   line fragments, scratches and irregular debris.
 const FOV_ERODE_FRAC   = 0.06; // Shrink the bright field-of-view mask inward by this
                                //   fraction of the image's smaller side. The aperture
@@ -263,12 +322,13 @@ fileInput.addEventListener('change', () => {
     srcImg.src = url;
 });
 
-// ---- Analyse button -------------------------------------------------
+// ---- Analyse (button + live slider re-runs) -------------------------
 
-analyseBtn.addEventListener('click', () => {
+function analyse() {
     if (!cvReady || !imgLoaded) return;
     analyseBtn.disabled    = true;
     analyseBtn.textContent = 'Analysing…';
+    document.getElementById('tuning').style.display = 'block';
     // Yield to the browser so the button label updates before heavy work
     setTimeout(() => {
         try     { runDetection(); }
@@ -278,7 +338,35 @@ analyseBtn.addEventListener('click', () => {
             analyseBtn.textContent = 'Analyse';
         }
     }, 30);
-});
+}
+
+analyseBtn.addEventListener('click', analyse);
+
+// Live-tuning sliders: update the parameter, its readout, then re-analyse
+// (debounced so dragging stays responsive).
+let tuneTimer = null;
+function scheduleAnalyse() {
+    clearTimeout(tuneTimer);
+    tuneTimer = setTimeout(analyse, 180);
+}
+
+function bindSlider(sliderId, valId, apply, fmt) {
+    const sl  = document.getElementById(sliderId);
+    const out = document.getElementById(valId);
+    sl.addEventListener('input', () => {
+        const v = parseFloat(sl.value);
+        apply(v);
+        out.textContent = fmt ? fmt(v) : v;
+        scheduleAnalyse();
+    });
+}
+
+bindSlider('sl-delta', 'v-delta', v => CELL_DARK_DELTA = v);
+bindSlider('sl-min',   'v-min',   v => CELL_MIN_AREA   = v);
+bindSlider('sl-max',   'v-max',   v => CELL_MAX_AREA   = v);
+bindSlider('sl-circ',  'v-circ',  v => CELL_MIN_CIRC   = v, v => v.toFixed(2));
+
+document.getElementById('cb-mask').addEventListener('change', scheduleAnalyse);
 
 // ---- Utility: safe delete OpenCV objects ----------------------------
 
@@ -429,11 +517,12 @@ function runDetection() {
         }
 
         // ── Step 3b: blob detection to find & count cells ─────────────
-        // Cells are found as dark spots standing out from the local background
-        // (see detectCells), filtered by size and roundness. Runs on the whole
-        // image — grid detection can be unreliable, and the masking inside
-        // detectCells already excludes the rim, surround and grid lines.
-        const cellCircles = detectCells(blurred);
+        // Cells are found as local spots standing out from the background (see
+        // detectCells), filtered by size and roundness. Runs on the whole image —
+        // grid detection can be unreliable, and the masking inside detectCells
+        // already excludes the rim, surround and grid lines.
+        const showMask = document.getElementById('cb-mask').checked;
+        const { cells: cellCircles, mask: cellMask } = detectCells(blurred, showMask);
 
         // ── Step 4: Render results ────────────────────────────────────
         const detected   = gridRect !== null;
@@ -443,6 +532,7 @@ function runDetection() {
         if (detected) drawOverlay(bestApprox, gridRect, confidence);
         else          drawFallback();
 
+        if (cellMask) drawMask(cellMask);
         drawCells(cellCircles);
         updateStatus(detected, gridRect, confidence, hCount, vCount, cellCircles.length);
 
@@ -455,34 +545,38 @@ function runDetection() {
 // ---- Cell (circle) detection ----------------------------------------
 
 /**
- * Detect cells as dark blobs that stand out from the local background, filtered
- * by size and roundness.
+ * Detect cells as local spots that stand out from the background, filtered by
+ * size and roundness.
  *
  * Pipeline:
  *   1. Build a field-of-view mask (lit aperture), eroded inward so the bright
  *      rim is excluded, and a bright grid-line mask. Their union is the area to
  *      ignore — the rim and rulings are the main false-positive sources.
- *   2. Estimate background illumination with a large blur and subtract it, so
- *      only local dark spots (cells) remain, not the smooth orange gradient.
- *   3. Threshold that darkness map, restrict it to the allowed area, and clean
- *      up speckle.
+ *   2. Estimate background illumination with a large blur and take the ABSOLUTE
+ *      difference, so any local spot survives whether it is lighter (a ring with
+ *      a bright centre) or darker than its surroundings — not the smooth gradient.
+ *   3. Threshold that deviation map, restrict it to the allowed area, de-speckle.
  *   4. Find contours and keep those whose area and circularity look cell-like.
  *
- * @param {cv.Mat} blurred  Blurred single-channel (8-bit) grayscale image.
- * @returns {Array<{x:number, y:number, r:number}>}
+ * @param {cv.Mat}  blurred  Blurred single-channel (8-bit) grayscale image.
+ * @param {boolean} wantMask When true, also return an ImageData of the thresholded
+ *                           blob map for on-screen debugging.
+ * @returns {{cells: Array<{x:number,y:number,r:number}>, mask: ?ImageData}}
  */
-function detectCells(blurred) {
+function detectCells(blurred, wantMask) {
     const out      = [];
     const mask     = new cv.Mat();
     const lineMask = new cv.Mat();
     const allow    = new cv.Mat();
     const bg       = new cv.Mat();
-    const dark     = new cv.Mat();
+    const dev      = new cv.Mat();
     const bin      = new cv.Mat();
     const contours = new cv.MatVector();
     const hier     = new cv.Mat();
     let   erodeK   = null;
+    let   lineK    = null;
     let   openK    = null;
+    let   maskData = null;
 
     try {
         const minSide = Math.min(blurred.cols, blurred.rows);
@@ -501,25 +595,25 @@ function detectCells(blurred) {
         cv.threshold(blurred, lineMask, m[0] + LINE_BRIGHT_DELTA, 255, cv.THRESH_BINARY);
         let lk = Math.max(3, Math.round(minSide * LINE_DILATE_FRAC));
         if (lk % 2 === 0) lk += 1;
-        openK = cv.Mat.ones(lk, lk, cv.CV_8U);
-        cv.dilate(lineMask, lineMask, openK, new cv.Point(-1, -1), 1);
+        lineK = cv.Mat.ones(lk, lk, cv.CV_8U);
+        cv.dilate(lineMask, lineMask, lineK, new cv.Point(-1, -1), 1);
 
         // allow = field interior AND NOT grid line
         cv.bitwise_not(lineMask, allow);
         cv.bitwise_and(mask, allow, allow);
 
-        // ── Background subtraction: keep only local dark spots ──
+        // ── Background subtraction: keep any local spot (lighter OR darker) ──
         let bk = Math.round(minSide * BG_BLUR_FRAC);
         if (bk % 2 === 0) bk += 1;
         bk = Math.max(3, bk);
         cv.GaussianBlur(blurred, bg, new cv.Size(bk, bk), 0);
-        cv.subtract(bg, blurred, dark);     // bright where image is darker than background
+        cv.absdiff(blurred, bg, dev);       // magnitude of local deviation, either sign
 
         // ── Threshold + restrict to the allowed area + de-speckle ──
-        cv.threshold(dark, bin, CELL_DARK_DELTA, 255, cv.THRESH_BINARY);
+        cv.threshold(dev, bin, CELL_DARK_DELTA, 255, cv.THRESH_BINARY);
         cv.bitwise_and(bin, allow, bin);
-        cv.morphologyEx(bin, bin, cv.MORPH_OPEN,
-            cv.Mat.ones(3, 3, cv.CV_8U), new cv.Point(-1, -1), 1);
+        openK = cv.Mat.ones(3, 3, cv.CV_8U);
+        cv.morphologyEx(bin, bin, cv.MORPH_OPEN, openK, new cv.Point(-1, -1), 1);
 
         // ── Contour analysis: keep cell-like blobs ──
         cv.findContours(bin, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
@@ -540,11 +634,26 @@ function detectCells(blurred) {
             }
             c.delete();
         }
+
+        // ── Optional debug mask: translucent green where a blob was found ──
+        if (wantMask) {
+            const w = bin.cols, h = bin.rows, d = bin.data;
+            const rgba = new Uint8ClampedArray(w * h * 4);
+            for (let i = 0; i < w * h; i++) {
+                if (d[i]) {
+                    rgba[i * 4]     = 45;
+                    rgba[i * 4 + 1] = 255;
+                    rgba[i * 4 + 2] = 122;
+                    rgba[i * 4 + 3] = 150;
+                }
+            }
+            maskData = new ImageData(rgba, w, h);
+        }
     } finally {
-        sdel(mask, lineMask, allow, bg, dark, bin, hier, erodeK, openK);
+        sdel(mask, lineMask, allow, bg, dev, bin, hier, erodeK, lineK, openK);
         sdel(contours);
     }
-    return out;
+    return { cells: out, mask: maskData };
 }
 
 // ---- Rendering helpers ----------------------------------------------
@@ -601,6 +710,15 @@ function drawOverlay(approxMat, rect, confidence) {
     ctx.fillText(label, lx + 6, ly);
 
     ctx.restore();
+}
+
+/** Overlay the (translucent) detection mask so misses/false-hits are visible. */
+function drawMask(imgData) {
+    const off = document.createElement('canvas');
+    off.width  = imgData.width;
+    off.height = imgData.height;
+    off.getContext('2d').putImageData(imgData, 0, 0);
+    ctx.drawImage(off, 0, 0);   // composites with per-pixel alpha over the photo
 }
 
 /** Outline each detected cell and stamp the running count. */
